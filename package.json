@@ -1,0 +1,31 @@
+{
+  "name": "dime-ocr",
+  "version": "1.0.0",
+  "description": "Self-hosted PDF data extraction API powered by GLM-OCR (via Ollama). Uploads PDFs, returns raw OCR data plus processed/structured data (transactions, balances, account metadata).",
+  "type": "module",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && find src -name '*.js' -exec node --check {} +"
+  },
+  "keywords": [
+    "ocr",
+    "pdf",
+    "glm-ocr",
+    "ollama",
+    "extraction",
+    "bank-statement"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "multer": "^2.0.1",
+    "mupdf": "^1.26.4"
+  }
+}
