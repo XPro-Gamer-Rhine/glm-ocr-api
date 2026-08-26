@@ -1,5 +1,9 @@
 node_modules/
 .env
+# Timestamped backups written when .env is rewritten. They hold the same live
+# keys the real file does, and nothing matches them without this line.
+.env.bak*
+.env.*.bak
 storage/uploads/*
 storage/data/*
 !storage/uploads/.gitkeep

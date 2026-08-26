@@ -201,6 +201,156 @@ storage/
 | `LLM_METADATA` | `true` | GLM info-extraction pass to refine metadata |
 | `DATA_DIR` | `storage` | Storage root |
 
+## Agent mode — extraction as a job, not a request
+
+Everything above is the LOCAL API: post a PDF, get data back. Agent mode is the
+same machinery with the product on the other end of it, and a second half
+bolted on — three models cross-checking what was read.
+
+```
+ dashboard ──► product API ──► OcrStatementJob (Mongo) ──► Spaces (the PDF)
+                    ▲                │                          │
+                    │ events         │ claim (outbound poll)    │ stream
+                    │                ▼                          ▼
+              apiRelay ◄──── worker ──► GLM-OCR ──► raw text ──► Claude ─┐
+                                                            ├─► GPT ─────┤─► 2 of 3 must agree
+                                                            └─► GLM ─────┘
+```
+
+**One-way by design.** This machine sits behind NAT with no inbound route. It
+polls the product for files, reads them, and relays every event back — nothing
+ever dials in, so it runs from any network with no tunnel or port-forward. Same
+inverted architecture as the month-end close agent and the helper agent, against
+a third set of internal routes. The full contract is in
+[docs/API-CONTRACT.md](docs/API-CONTRACT.md).
+
+### Why three models
+
+A single model reading a scanned statement is confidently wrong in a way that is
+invisible downstream. It does not stop at a smudged digit and ask — it produces a
+number, and the number lands in someone's books.
+
+Three independent reads make the failure VISIBLE. A misread becomes a
+disagreement, and a disagreement is a flag rather than a silent error. That is
+the entire argument for the cost of running it, and it only holds while the three
+are genuinely independent: same prompt, same text, three different companies'
+models, none of them shown another's answer.
+
+| Reader | Runs on | Costs |
+| --- | --- | --- |
+| **Claude** | the local Claude Code CLI (this machine's subscription) | nothing per call |
+| **GPT** | the OpenAI API, reusing the product's own `OPENAI_API_KEY` | per token |
+| **GLM** | a chat model on the same Ollama that did the OCR | nothing per call |
+
+GLM-OCR is the only thing that ever sees the PAGE; the three voters only ever see
+its text. The OCR model is specialized for reading documents and the reasoning
+models are not — asking three general models to squint at a scan would add three
+transcription errors on top of the extraction errors this is meant to catch.
+
+**`GLM_CHAT_MODEL` is not `glm-ocr`.** glm-ocr is 0.9B and reads pixels; it
+cannot weigh a balance chain, so the vote needs a chat model beside it.
+`npm run agent:worker` pulls both on boot — GLM-OCR because nothing can be read
+without it, and the chat model because finding it missing at the vote means a
+statement was already downloaded and OCR'd for twenty minutes first. To pull it
+by hand: `ollama pull glm4:9b`.
+
+### What agreement means
+
+Every value is voted on, and a value only becomes the answer when at least two
+readers produced it independently. Everything else is recorded and reported —
+never dropped, never resolved by picking a favourite model.
+
+- **Money** is compared in integer cents, **dates** as ISO days, **text** through
+  a key that ignores case, punctuation and whitespace. Three models WILL write
+  `1,234.50`, `1234.5` and `1234.50`; a vote that sees three strings reports a
+  disagreement that does not exist.
+- **Rows** match on date + amount + a short description prefix. A second, looser
+  pass matches on date + amount alone, so a narrative one model read badly still
+  agrees on the money and only the text goes to a vote.
+- **Null is a vote.** "Nothing is printed here" is a claim about the document.
+  But a null that wins while some model had a value is still flagged — the most
+  dangerous thing a model can do is invent a figure, and the second most
+  dangerous is for the others to quietly overrule one that was really there.
+- **Three models agreeing proves they read the same thing, not that they read
+  everything.** A page dropped by all three is unanimous and wrong. So the
+  result is also reconciled against the statement's own arithmetic: the balance
+  column walking, `opening + net == closing`, and the printed totals matching
+  the extracted ones. `reconciliation.provablyComplete` is the one field that
+  says the extraction can be trusted without opening the PDF.
+
+Verdict is `extracted` when every critical field reached quorum, the transaction
+agreement clears its threshold, and nothing in the reconciliation contradicts it.
+Otherwise `needs_review` — which is still a complete, delivered extraction, with
+every dissent attached.
+
+### Running it
+
+```bash
+npm run agent:doctor      # every backend, both models, the three readers
+npm run agent:worker      # claim and extract, forever
+```
+
+`agent:doctor` is the first thing to run on a new machine. It checks each
+backend's routes and token, that Ollama is serving and its models are pulled, and
+that at least a quorum of readers can actually run — before a job is claimed and
+fails forty minutes into an OCR run.
+
+Without the product, on a file on this disk:
+
+```bash
+npm run agent:extract -- ./statement.pdf --out result.json
+```
+
+Same pipeline, same prompts, same vote, nothing on a job board. This is how a
+change to the prompts, the chunk size or the vote gets tested.
+
+### Several backends, one agent
+
+`DIME_ENVIRONMENTS=local,qa,prod` names the backends; each one's settings are the
+ordinary keys with the name appended (`DIME_API_BASE_URL_QA`,
+`OCR_BRIDGE_TOKEN_PROD`, …), falling back to the unsuffixed key.
+
+**That list is not duplicated here.** It is read from the helper agent's `.env`
+via `DIME_SHARED_ENV_FILE` (default `../dime-helper-agent/.env`), because the
+backend list belongs to the company, not to one agent — and a second copy is the
+one nobody remembers to update. This repo's own `.env` adds only what is its own:
+the OCR bridge token and the three models.
+
+One worker per backend runs in this process, each claiming only its own board's
+jobs, and an AsyncLocalStorage (`src/agent/env.js`) pins every job to its backend
+so a production statement can never be reported into QA.
+
+### Agent layout
+
+```
+src/agent/
+├── bootstrapEnv.js        the .env chain, including the shared backend file
+├── config.js              every tunable
+├── env.js                 which backend this work belongs to (AsyncLocalStorage)
+├── cli.js                 worker / doctor / extract
+├── worker.js              claim → read → vote → resolve
+├── apiRelay.js            ordered, batched, retried event delivery
+├── events.js              the event contract the UI consumes
+├── download.js            stream the file down, verify its checksum
+├── jobs/statement.js      one document type, end to end
+└── consensus/
+    ├── index.js           run the three, then vote
+    ├── schema.js          the one contract all three answer in
+    ├── normalize.js       cents, ISO days, comparison keys
+    ├── vote.js            quorum, row matching, disputes
+    ├── parse.js           getting an object out of a model's reply
+    └── analysts/          claude.js · openai.js · glm.js
+```
+
+### Adding a document type
+
+1. `kindRegistry` entry in the API's `models/accountant/OcrAgentJob.js` — its own
+   collection, its own bucket.
+2. `src/agent/jobs/<kind>.js` exporting `{kind, run}`.
+3. Register it in `HANDLERS` in `src/agent/worker.js`.
+
+The routes, the worker loop, the relay and the consensus engine do not change.
+
 ## VPS notes
 
 - Linux install path needs root or sudo (`curl -fsSL https://ollama.com/install.sh | sh`).

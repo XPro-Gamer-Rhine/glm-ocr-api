@@ -3,11 +3,21 @@ import { createLogger } from "../utils/logger.js";
 import Extraction, { EXTRACTION_STATUS } from "../models/extraction.model.js";
 import jobQueue from "./jobQueue.js";
 import PdfRenderer from "./pdf/pdfRenderer.js";
-import { ocrPage, extractStructured } from "./ocr/glmOcr.service.js";
+import { extractStructured } from "./ocr/glmOcr.service.js";
+import { readDocument, choosePageText } from "./rawRead.service.js";
 import { analyzeDocument, parseAmount, normalizeDate } from "./analysis.service.js";
-import { engineState, refreshEngineState } from "../bootstrap/index.js";
 
 const log = createLogger("extraction");
+
+/**
+ * The LOCAL pipeline — upload straight to this server, no product involved.
+ *
+ * The reading itself lives in `rawRead.service.js`, shared with the agent
+ * worker: one implementation of render → OCR → per-page DPI retry, so the rule
+ * that decides whether a page's amounts exist cannot drift between the two
+ * entry points. What is here is the part the agent does differently — a local
+ * Extraction record, a single-model analysis, and no consensus.
+ */
 
 /** Schema handed to GLM-OCR's information-extraction mode for page 1. */
 const METADATA_SCHEMA = {
@@ -42,34 +52,6 @@ export function resumePendingJobs() {
   return interrupted.length;
 }
 
-/**
- * Fraction of date-led transaction lines that carry at least one money-like
- * number. A statement page where this collapses means the OCR dropped the
- * amount/balance columns at this DPI.
- */
-function ocrMoneyCoverage(markdown) {
-  const lines = markdown
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => /^(?:[A-Z][a-z]{2}\s+\d{1,2}|\d{1,2}[-/.]\d{1,2})(?:[-/.]\d{2,4})?\s+\S/.test(l));
-  const moneyRows = lines.filter((l) => /\d[.,]\d{2}\b|\d,\d{3}/.test(l)).length;
-  return { rows: lines.length, moneyRows, coverage: lines.length ? moneyRows / lines.length : 1 };
-}
-
-async function mapWithConcurrency(count, limit, worker) {
-  const results = new Array(count);
-  let nextIndex = 0;
-  const runners = Array.from({ length: Math.max(1, Math.min(limit, count)) }, async () => {
-    while (true) {
-      const i = nextIndex++;
-      if (i >= count) return;
-      results[i] = await worker(i);
-    }
-  });
-  await Promise.all(runners);
-  return results;
-}
-
 export async function runExtraction(id) {
   const record = Extraction.get(id);
   if (!record) return;
@@ -80,104 +62,34 @@ export async function runExtraction(id) {
     timings: { ...record.timings, startedAt: new Date().toISOString() },
   });
 
-  let renderer;
   try {
-    renderer = new PdfRenderer(record.file.storedPath, { dpi: config.extraction.renderDpi });
-    const pagesTotal = renderer.pageCount;
-    Extraction.setProgress(id, { stage: "reading", pagesTotal, pagesDone: 0, percent: 1 });
-    log.info(`[${id}] ${record.file.originalName}: ${pagesTotal} pages`);
+    Extraction.setProgress(id, { stage: "reading", pagesDone: 0, percent: 1 });
+    log.info(`[${id}] ${record.file.originalName}`);
 
-    // Embedded text layer — free, and the fallback when OCR is unavailable.
-    const embeddedPages = [];
-    for (let i = 0; i < pagesTotal; i += 1) {
-      embeddedPages.push(renderer.extractPageText(i));
-    }
-
-    await refreshEngineState();
-    const wantOcr = record.options?.ocr !== false;
-    const useOcr = wantOcr && engineState.serving && engineState.modelReady;
-    if (wantOcr && !useOcr) {
-      log.warn(`[${id}] GLM-OCR unavailable (${engineState.lastError || "not ready"}) — embedded text only.`);
-    }
-
-    // OCR every page through GLM-OCR, a few pages in flight at a time.
-    let pagesDone = 0;
-    let ocrPages = null;
-    if (useOcr) {
-      Extraction.setProgress(id, { stage: "ocr", percent: 5 });
-      ocrPages = await mapWithConcurrency(pagesTotal, config.extraction.ocrConcurrency, async (i) => {
-        let result;
-        try {
-          const png = renderer.renderPageToPng(i);
-          const { markdown, durationMs } = await ocrPage(png);
-          result = { page: i + 1, markdown, durationMs, dpi: config.extraction.renderDpi, error: null };
-        } catch (err) {
-          log.warn(`[${id}] OCR failed on page ${i + 1}: ${err.message}`);
-          result = { page: i + 1, markdown: null, durationMs: null, error: err.message };
-        }
-        pagesDone += 1;
+    const read = await readDocument(record.file.storedPath, {
+      ocr: record.options?.ocr !== false,
+      label: id,
+      onPage: ({ page, pageCount, retried }) => {
         Extraction.setProgress(id, {
-          pagesDone,
-          percent: 5 + Math.round((pagesDone / pagesTotal) * 85),
+          stage: retried ? `ocr-retry-p${page}` : "ocr",
+          pagesTotal: pageCount,
+          pagesDone: page,
+          percent: 5 + Math.round((page / pageCount) * 85),
         });
-        return result;
-      });
+      },
+    });
 
-      // GLM-OCR quality varies per (page, DPI): a page can lose its amount
-      // columns at one DPI and be perfect at another. Detect pages whose
-      // transaction lines carry too few numbers and re-OCR them at the
-      // fallback DPI, keeping whichever variant reads more money rows.
-      const retryDpi = config.extraction.retryDpi;
-      if (retryDpi && retryDpi !== config.extraction.renderDpi) {
-        for (let i = 0; i < pagesTotal; i += 1) {
-          const current = ocrPages[i]?.markdown;
-          if (!current) continue;
-          const quality = ocrMoneyCoverage(current);
-          if (quality.rows < 3 || quality.coverage >= 0.6) continue;
+    Extraction.setProgress(id, { stage: "analyzing", pagesTotal: read.pageCount, percent: 92 });
+    const processed = analyzeDocument(read.pages.map((p) => ({ page: p.page, text: p.text })));
+    processed.pageCount = read.pageCount;
 
-          log.warn(
-            `[${id}] page ${i + 1}: only ${quality.moneyRows}/${quality.rows} transaction ` +
-              `lines carry amounts — retrying at ${retryDpi} DPI`
-          );
-          Extraction.setProgress(id, { stage: `ocr-retry-p${i + 1}` });
-          try {
-            const png = renderer.renderPageToPng(i, retryDpi);
-            const { markdown, durationMs } = await ocrPage(png);
-            const retryQuality = ocrMoneyCoverage(markdown);
-            if (
-              retryQuality.moneyRows > quality.moneyRows ||
-              (retryQuality.moneyRows === quality.moneyRows && retryQuality.rows > quality.rows)
-            ) {
-              ocrPages[i] = { page: i + 1, markdown, durationMs, dpi: retryDpi, retried: true, error: null };
-              log.info(`[${id}] page ${i + 1}: retry kept (${retryQuality.moneyRows}/${retryQuality.rows} money rows).`);
-            } else {
-              log.info(`[${id}] page ${i + 1}: retry not better, keeping original.`);
-            }
-          } catch (err) {
-            log.warn(`[${id}] page ${i + 1} retry failed: ${err.message}`);
-          }
-        }
-      }
-    }
-
-    // Analysis input, chosen per page: a digital page's embedded text layer is
-    // authoritative (no OCR errors); OCR covers scanned pages.
-    Extraction.setProgress(id, { stage: "analyzing", percent: 92 });
-    const analysisPages = Array.from({ length: pagesTotal }, (_, i) => ({
-      page: i + 1,
-      text: choosePageText(embeddedPages[i], ocrPages?.[i]?.markdown),
-    }));
-    const analysisSources = Array.from({ length: pagesTotal }, (_, i) =>
-      pageSourceName(embeddedPages[i], ocrPages?.[i]?.markdown)
-    );
-    const processed = analyzeDocument(analysisPages);
-    processed.pageCount = pagesTotal;
-
-    // Optional second pass: GLM-OCR information-extraction on page 1
-    // fills metadata the regex heuristics missed.
-    if (useOcr && config.extraction.llmMetadata) {
+    // Optional second pass: GLM-OCR information-extraction on page 1 fills
+    // metadata the regex heuristics missed.
+    if (read.engine.ocrUsed && config.extraction.llmMetadata) {
+      let renderer;
       try {
         Extraction.setProgress(id, { stage: "refining-metadata", percent: 95 });
+        renderer = new PdfRenderer(record.file.storedPath, { dpi: config.extraction.renderDpi });
         const structured = await extractStructured(
           renderer.renderPageToPng(0),
           METADATA_SCHEMA,
@@ -186,38 +98,30 @@ export async function runExtraction(id) {
         mergeLlmMetadata(processed, structured);
       } catch (err) {
         log.warn(`[${id}] Metadata refinement failed: ${err.message}`);
+      } finally {
+        renderer?.close();
       }
     }
 
-    const embeddedCombined = embeddedPages.join("\n\n");
-    const ocrCombined = ocrPages
-      ? ocrPages.map((p) => p.markdown || "").join("\n\n")
-      : null;
-
     const raw = {
-      source: useOcr ? "glm-ocr" : "embedded-text",
-      analysisSources,
-      pageCount: pagesTotal,
-      characters: (ocrCombined ?? embeddedCombined).length,
-      text: embeddedCombined,
-      textPages: embeddedPages,
-      ocr: ocrPages
-        ? { model: config.ollama.model, combined: ocrCombined, pages: ocrPages }
+      source: read.source,
+      analysisSources: read.pages.map((p) => p.source),
+      pageCount: read.pageCount,
+      characters: read.characters,
+      text: read.embeddedPages.join("\n\n"),
+      textPages: read.embeddedPages,
+      ocr: read.ocrPages
+        ? { model: read.model, combined: read.combined, pages: read.ocrPages }
         : null,
-      pdfMetadata: renderer.getMetadata(),
+      pdfMetadata: read.pdfMetadata,
     };
 
     Extraction.update(id, {
       status: EXTRACTION_STATUS.COMPLETED,
       raw,
       processed,
-      engine: {
-        ocrUsed: useOcr,
-        model: useOcr ? config.ollama.model : null,
-        ollamaVersion: engineState.serverVersion,
-        renderDpi: config.extraction.renderDpi,
-      },
-      progress: { stage: "done", pagesTotal, pagesDone: pagesTotal, percent: 100 },
+      engine: read.engine,
+      progress: { stage: "done", pagesTotal: read.pageCount, pagesDone: read.pageCount, percent: 100 },
       timings: {
         ...Extraction.get(id).timings,
         completedAt: new Date().toISOString(),
@@ -240,27 +144,7 @@ export async function runExtraction(id) {
         durationMs: Date.now() - startedAt,
       },
     });
-  } finally {
-    renderer?.close();
   }
-}
-
-/**
- * A digital page's embedded text layer beats OCR (it IS the document data);
- * scanned pages have no real text layer, so OCR is the only source.
- */
-const DIGITAL_PAGE_MIN_CHARS = 200;
-
-function choosePageText(embedded, ocrMarkdown) {
-  const text = (embedded || "").trim();
-  if (text.length >= DIGITAL_PAGE_MIN_CHARS) return embedded;
-  return ocrMarkdown || embedded || "";
-}
-
-function pageSourceName(embedded, ocrMarkdown) {
-  const text = (embedded || "").trim();
-  if (text.length >= DIGITAL_PAGE_MIN_CHARS) return "embedded-text";
-  return ocrMarkdown ? "glm-ocr" : "embedded-text";
 }
 
 /**

@@ -1,7 +1,7 @@
 {
   "name": "dime-ocr",
   "version": "1.0.0",
-  "description": "Self-hosted PDF data extraction API powered by GLM-OCR (via Ollama). Uploads PDFs, returns raw OCR data plus processed/structured data (transactions, balances, account metadata).",
+  "description": "Document extraction agent + API. GLM-OCR (via Ollama) reads the pages; Claude, GPT and GLM independently extract the data and must agree. Claims jobs from the Dime product's boards over an outbound-only connection.",
   "type": "module",
   "main": "server.js",
   "engines": {
@@ -10,7 +10,12 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js && find src -name '*.js' -exec node --check {} +"
+    "check": "node --check server.js && find src -name '*.js' -exec node --check {} +",
+    "agent": "node src/agent/cli.js worker",
+    "agent:worker": "node src/agent/cli.js worker",
+    "agent:doctor": "node src/agent/cli.js doctor",
+    "agent:extract": "node src/agent/cli.js extract",
+    "test": "node --test test/"
   },
   "keywords": [
     "ocr",

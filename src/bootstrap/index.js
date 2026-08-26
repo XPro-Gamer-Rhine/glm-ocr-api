@@ -37,6 +37,45 @@ export async function refreshEngineState() {
 }
 
 /**
+ * Make sure a model the AGENT needs is pulled, beyond the OCR model above.
+ *
+ * The boot sequence pulls GLM-OCR because the plain HTTP API cannot read a
+ * scanned page without it. The agent needs a second, unrelated model: the GLM
+ * chat model that casts the third vote. Nothing in the API path wants it, so it
+ * is pulled here rather than in `ensureOcrReady` — and it is pulled at BOOT
+ * rather than at the vote, because discovering it missing at the vote means a
+ * statement was claimed, downloaded and OCR'd for twenty minutes first.
+ *
+ * Never throws. A missing voter is a degraded worker, not a dead one: the
+ * consensus still reaches a verdict on two readers, and `doctor` says which one
+ * is absent.
+ *
+ * @returns {{ok: boolean, model: string, reason?: string}}
+ */
+export async function ensureChatModel(model) {
+  if (!model) return { ok: false, model, reason: "no model configured" };
+  try {
+    if (!engineState.serving) {
+      await refreshEngineState();
+      if (!engineState.serving) {
+        return { ok: false, model, reason: "Ollama is not serving" };
+      }
+    }
+    if (await isModelPulled(config.ollama.host, model)) {
+      log.info(`Chat model "${model}" already pulled.`);
+      return { ok: true, model };
+    }
+    if (!config.bootstrap.autoPullModel) {
+      return { ok: false, model, reason: `not pulled and AUTO_PULL_MODEL is disabled` };
+    }
+    await pullModel(config.ollama.host, model);
+    return { ok: true, model };
+  } catch (err) {
+    return { ok: false, model, reason: err.message };
+  }
+}
+
+/**
  * Full boot sequence:
  *   1. detect OS  2. find or install ollama  3. start server  4. pull model
  * Never throws — a failed step leaves the API running in degraded mode
